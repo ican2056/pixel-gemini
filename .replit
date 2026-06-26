@@ -1,0 +1,48 @@
+modules = ["python-3.11"]
+[agent]
+expertMode = true
+stack = "BEST_EFFORT_FALLBACK"
+
+[nix]
+channel = "stable-25_05"
+packages = ["geckodriver"]
+
+[workflows]
+runButton = "Project"
+
+[[workflows.workflow]]
+name = "Project"
+mode = "parallel"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "Start application"
+
+[[workflows.workflow]]
+name = "Start application"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "python main.py"
+
+[workflows.workflow.metadata]
+outputType = "console"
+
+[[workflows.workflow]]
+name = "test"
+mode = "sequential"
+author = 61352481
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "git commit -m \"first commit\""
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "git branch -M main"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "git remote add origin https://github.com/TajAlasfiyaa/v01.git"

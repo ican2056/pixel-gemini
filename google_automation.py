@@ -61,45 +61,95 @@ def _report(cb: ProgressCB, msg: str, driver: Optional[webdriver.Chrome] = None)
 # ── Driver factory ────────────────────────────────────────────────────────────
 
 def _build_driver(profile: DeviceProfile) -> webdriver.Chrome:
-    """Return a headless Chrome WebDriver configured for the device profile."""
+    """
+    Return a headless Chrome WebDriver fully configured to impersonate a
+    real Google Pixel 10 Pro running Android 16.
+
+    Layers of spoofing applied:
+      1. Chrome options  – mobile emulation, correct viewport & pixel ratio
+      2. CDP commands    – UA client hints, device metrics override
+      3. JS injection    – navigator props, WebGL GPU, battery, connection
+    """
     options = Options()
 
     if config.HEADLESS:
         options.add_argument("--headless=new")
 
+    # ── Core flags ────────────────────────────────────────────────────────────
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
     options.add_argument("--disable-extensions")
     options.add_argument("--disable-infobars")
     options.add_argument("--disable-notifications")
-    options.add_argument("--window-size=390,844")
-    options.add_argument(f"--user-agent={profile.user_agent}")
-    options.add_argument("--js-flags=--max-old-space-size=256")
-    options.add_argument("--renderer-process-limit=1")
+    options.add_argument("--mute-audio")
     options.add_argument("--disable-background-networking")
     options.add_argument("--disable-sync")
     options.add_argument("--metrics-recording-only")
-    options.add_argument("--mute-audio")
+    options.add_argument("--js-flags=--max-old-space-size=512")
+    options.add_argument("--renderer-process-limit=1")
 
+    # ── Window size matches Pixel 10 Pro CSS viewport ─────────────────────────
+    w, h = profile.screen_width, profile.screen_height
+    options.add_argument(f"--window-size={w},{h}")
+    options.add_argument(f"--user-agent={profile.user_agent}")
+
+    # ── Anti-detection ────────────────────────────────────────────────────────
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    options.add_experimental_option("useAutomationExtension", False)
+
+    # ── Mobile emulation (Chrome-level) ──────────────────────────────────────
     mobile_emulation = {
-        "deviceMetrics": {"width": 390, "height": 844, "pixelRatio": 3.0},
+        "deviceMetrics": {
+            "width":       profile.screen_width,
+            "height":      profile.screen_height,
+            "pixelRatio":  profile.pixel_ratio,
+            "touch":       True,
+        },
         "userAgent": profile.user_agent,
     }
     options.add_experimental_option("mobileEmulation", mobile_emulation)
-    options.add_experimental_option("excludeSwitches", ["enable-automation"])
-    options.add_experimental_option("useAutomationExtension", False)
-    options.add_argument("--disable-blink-features=AutomationControlled")
 
-    chromium_binary = (
-        shutil.which("chromium")
-        or shutil.which("chromium-browser")
-        or "/nix/store/qa9cnw4v5xkxyip6mb9kxqfq1z4x2dx1-chromium-138.0.7204.100/bin/chromium"
-    )
+    # ── Launch browser ────────────────────────────────────────────────────────
+    chromium_binary = shutil.which("chromium") or shutil.which("chromium-browser")
     chromedriver_binary = shutil.which("chromedriver") or "chromedriver"
-    options.binary_location = chromium_binary
+    if chromium_binary:
+        options.binary_location = chromium_binary
     service = Service(executable_path=chromedriver_binary)
     driver = webdriver.Chrome(service=service, options=options)
+
+    # ── CDP: device metrics override (authoritative screen size + touch) ──────
+    driver.execute_cdp_cmd("Emulation.setDeviceMetricsOverride", {
+        "width":             profile.screen_width,
+        "height":            profile.screen_height,
+        "deviceScaleFactor": profile.pixel_ratio,
+        "mobile":            True,
+        "screenWidth":       profile.screen_width,
+        "screenHeight":      profile.screen_height,
+        "positionX":         0,
+        "positionY":         0,
+    })
+
+    # ── CDP: User-Agent + full client hints (Sec-CH-UA-*) ────────────────────
+    driver.execute_cdp_cmd("Emulation.setUserAgentOverride", {
+        "userAgent":         profile.user_agent,
+        "acceptLanguage":    "en-US,en;q=0.9",
+        "platform":          "Linux armv8l",
+        "userAgentMetadata": profile.client_hints_metadata(),
+    })
+
+    # ── CDP: Touch emulation (10-point multitouch) ────────────────────────────
+    driver.execute_cdp_cmd("Emulation.setTouchEmulationEnabled", {
+        "enabled":    True,
+        "maxTouchPoints": profile.max_touch_points,
+    })
+
+    # ── CDP: inject navigator overrides before every page load ────────────────
+    driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+        "source": profile.navigator_js()
+    })
+
     driver.implicitly_wait(config.IMPLICIT_WAIT)
     driver.set_page_load_timeout(config.PAGE_LOAD_TIMEOUT)
     return driver

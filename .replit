@@ -19,6 +19,10 @@ author = "agent"
 task = "workflow.run"
 args = "Start application"
 
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "Test TOTP Login"
+
 [[workflows.workflow]]
 name = "Start application"
 author = "agent"
@@ -31,18 +35,12 @@ args = "python main.py"
 outputType = "console"
 
 [[workflows.workflow]]
-name = "test"
-mode = "sequential"
-author = 61352481
+name = "Test TOTP Login"
+author = "agent"
 
 [[workflows.workflow.tasks]]
 task = "shell.exec"
-args = "git commit -m \"first commit\""
+args = "python test_totp.py"
 
-[[workflows.workflow.tasks]]
-task = "shell.exec"
-args = "git branch -M main"
-
-[[workflows.workflow.tasks]]
-task = "shell.exec"
-args = "git remote add origin https://github.com/TajAlasfiyaa/v01.git"
+[workflows.workflow.metadata]
+outputType = "console"

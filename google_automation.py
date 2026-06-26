@@ -63,19 +63,21 @@ def _report(cb: ProgressCB, msg: str, driver: Optional[webdriver.Chrome] = None)
 def _build_driver(profile: DeviceProfile) -> webdriver.Chrome:
     """
     Return a headless Chrome WebDriver fully configured to impersonate a
-    real Google Pixel 10 Pro running Android 16.
+    real Google Pixel 10 Pro running Android 16 / Chrome 149.
 
-    Layers of spoofing applied:
-      1. Chrome options  – mobile emulation, correct viewport & pixel ratio
-      2. CDP commands    – UA client hints, device metrics override
-      3. JS injection    – navigator props, WebGL GPU, battery, connection
+    Spoofing layers (applied in order):
+      1. Chrome launch flags   – mobile emulation, reduced UA, anti-detection
+      2. CDP commands          – authoritative screen metrics, UA client hints,
+                                 touch emulation
+      3. JS injection          – navigator props, WebGL GPU, battery, network,
+                                 chrome runtime object, plugins
     """
     options = Options()
 
     if config.HEADLESS:
         options.add_argument("--headless=new")
 
-    # ── Core flags ────────────────────────────────────────────────────────────
+    # ── Core stability flags ──────────────────────────────────────────────────
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
@@ -89,7 +91,11 @@ def _build_driver(profile: DeviceProfile) -> webdriver.Chrome:
     options.add_argument("--js-flags=--max-old-space-size=512")
     options.add_argument("--renderer-process-limit=1")
 
-    # ── Window size matches Pixel 10 Pro CSS viewport ─────────────────────────
+    # ── Realism flags (match a real Chrome on Android) ────────────────────────
+    options.add_argument("--enable-features=NetworkService,NetworkServiceInProcess")
+    options.add_argument("--lang=en-US")
+
+    # ── Window size = Pixel 10 Pro CSS viewport ───────────────────────────────
     w, h = profile.screen_width, profile.screen_height
     options.add_argument(f"--window-size={w},{h}")
     options.add_argument(f"--user-agent={profile.user_agent}")
@@ -99,13 +105,14 @@ def _build_driver(profile: DeviceProfile) -> webdriver.Chrome:
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option("useAutomationExtension", False)
 
-    # ── Mobile emulation (Chrome-level) ──────────────────────────────────────
+    # ── Chrome-level mobile emulation ─────────────────────────────────────────
+    # Reduced UA: "Android 10; K" — device model intentionally absent (Chrome 110+)
     mobile_emulation = {
         "deviceMetrics": {
-            "width":       profile.screen_width,
-            "height":      profile.screen_height,
-            "pixelRatio":  profile.pixel_ratio,
-            "touch":       True,
+            "width":      w,
+            "height":     h,
+            "pixelRatio": profile.pixel_ratio,
+            "touch":      True,
         },
         "userAgent": profile.user_agent,
     }
@@ -119,19 +126,20 @@ def _build_driver(profile: DeviceProfile) -> webdriver.Chrome:
     service = Service(executable_path=chromedriver_binary)
     driver = webdriver.Chrome(service=service, options=options)
 
-    # ── CDP: device metrics override (authoritative screen size + touch) ──────
+    # ── CDP layer 1: authoritative screen metrics + touch ─────────────────────
     driver.execute_cdp_cmd("Emulation.setDeviceMetricsOverride", {
-        "width":             profile.screen_width,
-        "height":            profile.screen_height,
+        "width":             w,
+        "height":            h,
         "deviceScaleFactor": profile.pixel_ratio,
         "mobile":            True,
-        "screenWidth":       profile.screen_width,
-        "screenHeight":      profile.screen_height,
+        "screenWidth":       w,
+        "screenHeight":      h,
         "positionX":         0,
         "positionY":         0,
     })
 
-    # ── CDP: User-Agent + full client hints (Sec-CH-UA-*) ────────────────────
+    # ── CDP layer 2: User-Agent + full Sec-CH-UA-* client hints ──────────────
+    # This is what Google reads to know the real device behind the reduced UA.
     driver.execute_cdp_cmd("Emulation.setUserAgentOverride", {
         "userAgent":         profile.user_agent,
         "acceptLanguage":    "en-US,en;q=0.9",
@@ -139,13 +147,14 @@ def _build_driver(profile: DeviceProfile) -> webdriver.Chrome:
         "userAgentMetadata": profile.client_hints_metadata(),
     })
 
-    # ── CDP: Touch emulation (10-point multitouch) ────────────────────────────
+    # ── CDP layer 3: multitouch emulation ────────────────────────────────────
     driver.execute_cdp_cmd("Emulation.setTouchEmulationEnabled", {
-        "enabled":    True,
+        "enabled":       True,
         "maxTouchPoints": profile.max_touch_points,
     })
 
-    # ── CDP: inject navigator overrides before every page load ────────────────
+    # ── CDP layer 4: JS navigator/WebGL/battery/network spoofing ─────────────
+    # Injected before every page's own JS runs.
     driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
         "source": profile.navigator_js()
     })

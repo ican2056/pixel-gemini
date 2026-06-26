@@ -13,42 +13,39 @@ DEVICE_BRAND        = "google"
 DEVICE_MANUFACTURER = "Google"
 ANDROID_VERSION     = "16"
 ANDROID_SDK         = "36"
-BUILD_ID            = "BP2A.250505.001"       # Realistic Pixel 10 Pro build ID
+BUILD_ID            = "CP1A.260405.005"       # Pixel 10 Pro build fingerprint
 
 # Hardware profile (used for navigator injection)
-DEVICE_RAM_GB       = 16                      # 16 GB RAM → reports 8 via API cap
-DEVICE_CPU_CORES    = 9                       # Tensor G5: 1+3+2+3 cluster = 9 cores
-DEVICE_MAX_TOUCH    = 10                      # 10-point multitouch
-DEVICE_GPU_VENDOR   = "Imagination Technologies"
-DEVICE_GPU_RENDERER = "PowerVR Rogue DXT72"   # Tensor G5 integrated GPU
+DEVICE_RAM_GB           = 16                  # 16 GB RAM (spoofed as 16 via JS)
+DEVICE_CPU_CORES        = 8                   # Tensor G5: 8 reported cores
+DEVICE_MAX_TOUCH        = 5                   # 5-point multitouch (realistic)
+DEVICE_GPU_VENDOR       = "Imagination Technologies"
+DEVICE_GPU_RENDERER     = "PowerVR DXT-48-1536"  # Tensor G5 GPU
 
-# Screen – Pixel 10 Pro: 6.3" OLED 1440×3120 @ 495 ppi
-# CSS viewport at ~3.5× density
+# Screen – Pixel 10 Pro: CSS viewport 412×915 @3.5× density (~495 PPI)
 SCREEN_CSS_WIDTH    = 412
-SCREEN_CSS_HEIGHT   = 917
+SCREEN_CSS_HEIGHT   = 915
 SCREEN_PIXEL_RATIO  = 3.5
 
-# Chrome 136 (latest stable on Android)
-CHROME_VERSION       = "136.0.7103.125"
-CHROME_MAJOR_VERSION = 136
+# ── Chrome 149 (latest stable on Android) ────────────────────────────────────
+CHROME_VERSION       = "149.0.7827.200"
+CHROME_MAJOR_VERSION = 149
 
-# User-Agent templates (Chrome 136, Android 16, Pixel 10 Pro)
+# ── User-Agent – Chrome UA Reduction (Chrome 110+) ───────────────────────────
+# Modern Chrome on Android NEVER reveals device model in the UA string.
+# The real device identity is sent via Sec-CH-UA-Model client hint.
+# Format: "Mozilla/5.0 (Linux; Android 10; K) ... Chrome/<version> Mobile Safari/537.36"
 USER_AGENT_TEMPLATES = [
     (
-        "Mozilla/5.0 (Linux; Android {android}; {model} Build/{build}) "
+        "Mozilla/5.0 (Linux; Android 10; K) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/{chrome} Mobile Safari/537.36"
-    ),
-    (
-        "Mozilla/5.0 (Linux; Android {android}; {model} Build/{build}; wv) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Version/4.0 Chrome/{chrome} Mobile Safari/537.36"
     ),
 ]
 
 # ── Google URLs ───────────────────────────────────────────────────────────────
-GMAIL_LOGIN_URL      = "https://accounts.google.com/signin/v2/identifier"
-GOOGLE_ONE_URL       = "https://one.google.com/"
+GMAIL_LOGIN_URL       = "https://accounts.google.com/signin/v2/identifier"
+GOOGLE_ONE_URL        = "https://one.google.com/"
 GOOGLE_ONE_OFFERS_URL = "https://one.google.com/about/plans"
 
 # ── Gemini offer detection keywords ──────────────────────────────────────────

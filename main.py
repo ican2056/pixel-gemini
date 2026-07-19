@@ -452,7 +452,13 @@ async def check_offer(update: Update,
                         )
                 finally:
                     if driver:
-                        close_driver(driver)
+                        if session.get("_driver") is driver:
+                            # Interactive 2FA owns this driver until the code is submitted.
+                            pass
+                        elif offer_link and session.get("_keep_browser_open"):
+                            session["_driver"] = driver
+                        else:
+                            close_driver(driver)
 
                 # If offer found, stop retrying
                 if offer_link:
@@ -521,6 +527,7 @@ async def handle_2fa_code(update: Update,
     code = update.message.text.strip()
 
     # Delete the message containing the code for security
+    offer_link = None
     try:
         await update.message.delete()
     except Exception:
@@ -530,7 +537,7 @@ async def handle_2fa_code(update: Update,
     if not driver:
         await context.bot.send_message(
             chat_id=chat_id,
-            text="⚠️ Session expired. Please run /check\_offer again.",
+            text=r"⚠️ Session expired. Please run /check\_offer again.",
         )
         return ConversationHandler.END
 
@@ -558,7 +565,7 @@ async def handle_2fa_code(update: Update,
                 close_driver(driver)
                 await context.bot.send_message(
                     chat_id=chat_id,
-                    text="❌ Code rejected. Please run /check\_offer again.",
+                    text=r"❌ Code rejected. Please run /check\_offer again.",
                 )
                 return ConversationHandler.END
 
@@ -568,7 +575,10 @@ async def handle_2fa_code(update: Update,
                     check_offer_with_driver, driver,
                 )
             finally:
-                close_driver(driver)
+                if offer_link and session.get("_keep_browser_open"):
+                    session["_driver"] = driver
+                else:
+                    close_driver(driver)
 
     except Exception as exc:
         logger.exception("Error in 2FA for chat %s", chat_id)
@@ -673,58 +683,76 @@ async def _session_cleanup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 # ── Application setup ─────────────────────────────────────────────────────────
 
 def main() -> None:
-    """Run one offer check from the Replit console."""
+    """Adapt console I/O to the existing, production-tested bot handlers."""
     from getpass import getpass
 
-    print("Pixel 10 Pro Google One Gemini Offer Checker")
-    email = input("Google email: ").strip()
-    if not re.match(r'^[\w.+-]+@[\w.-]+\.[a-zA-Z]{2,}$', email, re.IGNORECASE):
-        print("Error: Please enter a valid Google account email.")
-        return
+    class _ConsoleChat:
+        id = 0
 
-    password = getpass("Google password (input hidden): ")
-    if not password:
-        print("Error: Password cannot be empty.")
-        return
+    class _ConsoleMessage:
+        def __init__(self) -> None:
+            self.text = ""
+
+        async def reply_text(self, text, **kwargs) -> None:
+            print(text)
+
+        async def delete(self) -> None:
+            self.text = ""
+
+    class _ConsoleUpdate:
+        def __init__(self) -> None:
+            self.effective_chat = _ConsoleChat()
+            self.message = _ConsoleMessage()
+
+    class _ConsoleBot:
+        async def send_message(self, chat_id, text, **kwargs) -> None:
+            print(text)
+
+    class _ConsoleContext:
+        def __init__(self) -> None:
+            self.user_data = {}
+            self.bot = _ConsoleBot()
+
+    async def _run_console_flow() -> None:
+        update = _ConsoleUpdate()
+        context = _ConsoleContext()
+        chat_id = update.effective_chat.id
+
+        print("Pixel 10 Pro Google One Gemini Offer Checker")
+        try:
+            while True:
+                update.message.text = input("Google email: ").strip()
+                if await login_email(update, context) == AWAIT_PASSWORD:
+                    break
+
+            update.message.text = getpass("Google password (input hidden): ")
+            await login_password(update, context)
+
+            session = _get_session(chat_id)
+            session["_keep_browser_open"] = True
+            result = await check_offer(update, context)
+
+            while result == AWAIT_2FA_CODE:
+                update.message.text = getpass(
+                    "6-digit authenticator code (input hidden): "
+                ).strip()
+                result = await handle_2fa_code(update, context)
+
+            driver = session.get("_driver")
+            if session.get("offer_link") and driver:
+                input("The browser will remain open. Press Enter to close it...")
+            close_driver(session.pop("_driver", None))
+        finally:
+            driver = _get_session(chat_id).pop("_driver", None)
+            close_driver(driver)
+            _clear_session(chat_id)
 
     # A visible Chromium window enables Replit's native VNC pane.
     config.HEADLESS = False
-    driver = None
-
     try:
-        print("Launching the browser and signing in...")
-        device = create_device_profile()
-        driver, login_status = start_login(email, password, device)
-
-        if login_status == "needs_totp":
-            while True:
-                code = getpass("6-digit authenticator code (input hidden): ").strip()
-                if code.isdigit() and len(code) == 6:
-                    break
-                print("Error: Please enter exactly six digits.")
-
-            if not submit_2fa_code(driver, code):
-                print("Error: The authenticator code was rejected.")
-                return
-
-        print("Login successful. Checking the Google One offer...")
-        offer_link = check_offer_with_driver(driver)
-        if not offer_link:
-            print("No valid Pixel Gemini offer link was found.")
-            return
-
-        print(f"Valid offer link: {offer_link}")
-        input("The browser will remain open. Press Enter to close it...")
+        asyncio.run(_run_console_flow())
     except KeyboardInterrupt:
         print("\nStopped by user.")
-    except GoogleAutomationError as exc:
-        print(f"Error: {exc}")
-    except Exception as exc:
-        logger.exception("Unexpected error in console offer check")
-        print(f"Unexpected error: {exc}")
-    finally:
-        password = ""
-        close_driver(driver)
 
 
 if __name__ == "__main__":

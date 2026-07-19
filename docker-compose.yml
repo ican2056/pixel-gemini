@@ -6,14 +6,6 @@ services:
     environment:
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
       - HEADLESS=true
-      - PROXY_ENABLED=0
-      - BROWSER_IGNORE_CERT_ERRORS=0
-      - GOOGLE_CAPTCHA_AUTO_SOLVE=0
-    dns:
-      - 1.1.1.1
-      - 8.8.8.8
-    dns_opt:
-      - use-vc
     volumes:
       - ./logs:/app/logs
     # Resource limits for 2.5GB RAM / 2 CPU servers

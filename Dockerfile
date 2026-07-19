@@ -25,6 +25,5 @@ COPY config.py main.py ./
 COPY core ./core
 COPY handlers ./handlers
 COPY services ./services
-COPY assets ./assets
 
 CMD ["python", "main.py"]

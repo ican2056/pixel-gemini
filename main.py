@@ -747,8 +747,15 @@ def main() -> None:
             close_driver(driver)
             _clear_session(chat_id)
 
-    # A visible Chromium window enables Replit's native VNC pane.
-    config.HEADLESS = False
+    # Match the upstream runtime by default. Set HEADLESS=false in Replit only
+    # when a visible Chromium window is needed in the VNC pane.
+    config.HEADLESS = os.environ.get("HEADLESS", "true").strip().lower() not in {
+        "0", "false", "no", "off",
+    }
+    logger.info(
+        "Browser mode: %s",
+        "headless (upstream default)" if config.HEADLESS else "visible/VNC",
+    )
     try:
         asyncio.run(_run_console_flow())
     except KeyboardInterrupt:

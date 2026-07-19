@@ -200,13 +200,17 @@ def _gmail_login(driver: webdriver.Chrome, email: str, password: str) -> str:
         "needs_totp" – TOTP / authenticator code required (driver stays on 2FA page)
     Raises GoogleAutomationError for unsupported 2FA types.
     """
+    stage = "opening Google sign-in page"
     try:
+        logger.info("Google login stage: %s", stage)
         driver.implicitly_wait(0)  # Prevent find_element from blocking
         driver.get(config.GMAIL_LOGIN_URL)
         time.sleep(3)  # Wait for page + injected JS to fully settle
 
         # ── Email step ────────────────────────────────────────────────────────
         # Retry up to 3 times to handle stale element from JS injection
+        stage = "waiting for email field"
+        logger.info("Google login stage: %s", stage)
         for _retry in range(3):
             try:
                 email_field = _wait_for(driver, By.CSS_SELECTOR,
@@ -220,21 +224,29 @@ def _gmail_login(driver: webdriver.Chrome, email: str, password: str) -> str:
         else:
             raise GoogleAutomationError("Email field stale after 3 retries")
 
+        stage = "waiting for email Next button"
+        logger.info("Google login stage: %s", stage)
         next_btn = _wait_for(driver, By.ID, "identifierNext")
         next_btn.click()
         time.sleep(1)
 
         # ── Password step ─────────────────────────────────────────────────────
+        stage = "waiting for password field"
+        logger.info("Google login stage: %s", stage)
         password_field = _wait_for(driver, By.CSS_SELECTOR,
                                    'input[type="password"]')
         password_field.clear()
         password_field.send_keys(password)
 
+        stage = "waiting for password Next button"
+        logger.info("Google login stage: %s", stage)
         pw_next = _wait_for(driver, By.ID, "passwordNext")
         pw_next.click()
         time.sleep(2)
 
         # ── Detect 2FA / verification challenges ─────────────────────────────
+        stage = "detecting post-password result"
+        logger.info("Google login stage: %s", stage)
         current_url = driver.current_url
         parsed = urlparse(current_url)
         hostname = parsed.hostname or ""
@@ -407,7 +419,38 @@ def _gmail_login(driver: webdriver.Chrome, email: str, password: str) -> str:
         return "failed"
 
     except TimeoutException as exc:
-        logger.error("Timeout during login: %s", exc)
+        try:
+            current_url = driver.current_url
+            page_title = driver.title
+        except WebDriverException:
+            current_url = "<unavailable>"
+            page_title = "<unavailable>"
+
+        screenshot_dir = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "logs",
+        )
+        os.makedirs(screenshot_dir, exist_ok=True)
+        screenshot_path = os.path.join(
+            screenshot_dir,
+            f"login_timeout_{int(time.time())}.png",
+        )
+        try:
+            driver.save_screenshot(screenshot_path)
+            logger.error("Login timeout screenshot saved to %s", screenshot_path)
+        except WebDriverException as screenshot_exc:
+            logger.warning(
+                "Could not save login timeout screenshot: %s",
+                screenshot_exc,
+            )
+
+        logger.error(
+            "Timeout during login at stage '%s' (URL: %s, title: %s): %s",
+            stage,
+            current_url,
+            page_title,
+            exc,
+        )
         return "failed"
     except WebDriverException as exc:
         logger.error("WebDriver error during login: %s", exc)
@@ -708,9 +751,9 @@ def start_login(email: str, password: str,
     try:
         status = _gmail_login(driver, email, password)
         if status == "failed":
-            driver.quit()
             raise GoogleAutomationError(
-                "Login failed – please check your credentials."
+                "Login failed before Google accepted or rejected the credentials. "
+                "Check the logged stage and timeout screenshot."
             )
         return driver, status
     except GoogleAutomationError:
@@ -744,4 +787,3 @@ def close_driver(driver) -> None:
             driver.quit()
         except Exception:
             pass
-

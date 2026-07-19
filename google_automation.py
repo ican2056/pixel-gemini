@@ -732,6 +732,18 @@ class GoogleAutomationError(Exception):
     """Raised when automation encounters an unrecoverable error."""
 
 
+def start_manual_login(device: DeviceProfile):
+    """Open Google sign-in and return the driver for a manual VNC login."""
+    logger.info("Starting WebDriver for manual session %s", device.session_id)
+    driver = _build_driver(device)
+    try:
+        driver.get(config.GMAIL_LOGIN_URL)
+        return driver
+    except Exception:
+        driver.quit()
+        raise
+
+
 def start_login(email: str, password: str,
                 device: DeviceProfile) -> tuple:
     """

@@ -34,6 +34,7 @@ import config
 from device_simulator import create_device_profile
 from google_automation import (
     GoogleAutomationError,
+    start_manual_login,
     start_login,
     submit_2fa_code,
     check_offer_with_driver,
@@ -683,83 +684,37 @@ async def _session_cleanup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 # ── Application setup ─────────────────────────────────────────────────────────
 
 def main() -> None:
-    """Adapt console I/O to the existing, production-tested bot handlers."""
-    from getpass import getpass
+    """Hand Google login to VNC, then run the original offer checker."""
+    config.HEADLESS = False
+    driver = None
 
-    class _ConsoleChat:
-        id = 0
-
-    class _ConsoleMessage:
-        def __init__(self) -> None:
-            self.text = ""
-
-        async def reply_text(self, text, **kwargs) -> None:
-            print(text)
-
-        async def delete(self) -> None:
-            self.text = ""
-
-    class _ConsoleUpdate:
-        def __init__(self) -> None:
-            self.effective_chat = _ConsoleChat()
-            self.message = _ConsoleMessage()
-
-    class _ConsoleBot:
-        async def send_message(self, chat_id, text, **kwargs) -> None:
-            print(text)
-
-    class _ConsoleContext:
-        def __init__(self) -> None:
-            self.user_data = {}
-            self.bot = _ConsoleBot()
-
-    async def _run_console_flow() -> None:
-        update = _ConsoleUpdate()
-        context = _ConsoleContext()
-        chat_id = update.effective_chat.id
-
-        print("Pixel 10 Pro Google One Gemini Offer Checker")
-        try:
-            while True:
-                update.message.text = input("Google email: ").strip()
-                if await login_email(update, context) == AWAIT_PASSWORD:
-                    break
-
-            update.message.text = getpass("Google password (input hidden): ")
-            await login_password(update, context)
-
-            session = _get_session(chat_id)
-            session["_keep_browser_open"] = True
-            result = await check_offer(update, context)
-
-            while result == AWAIT_2FA_CODE:
-                update.message.text = getpass(
-                    "6-digit authenticator code (input hidden): "
-                ).strip()
-                result = await handle_2fa_code(update, context)
-
-            driver = session.get("_driver")
-            if session.get("offer_link") and driver:
-                input("The browser will remain open. Press Enter to close it...")
-            close_driver(session.pop("_driver", None))
-        finally:
-            driver = _get_session(chat_id).pop("_driver", None)
-            close_driver(driver)
-            _clear_session(chat_id)
-
-    # Match the upstream runtime by default. Set HEADLESS=false in Replit only
-    # when a visible Chromium window is needed in the VNC pane.
-    config.HEADLESS = os.environ.get("HEADLESS", "true").strip().lower() not in {
-        "0", "false", "no", "off",
-    }
-    logger.info(
-        "Browser mode: %s",
-        "headless (upstream default)" if config.HEADLESS else "visible/VNC",
-    )
+    print("Pixel 10 Pro Google One Gemini Offer Checker")
+    print("Opening Google sign-in in the Replit VNC browser...")
     try:
-        asyncio.run(_run_console_flow())
+        device = create_device_profile()
+        driver = start_manual_login(device)
+        input(
+            "Complete Google login and any verification in VNC, then press Enter "
+            "here to check the offer..."
+        )
+
+        print("Checking the Google One Gemini offer...")
+        offer_link = check_offer_with_driver(driver)
+        if offer_link:
+            print(f"Valid offer link: {offer_link}")
+        else:
+            print("No valid Pixel Gemini offer link was found.")
+
+        input("The browser will remain open. Press Enter to close it...")
     except KeyboardInterrupt:
         print("\nStopped by user.")
+    except GoogleAutomationError as exc:
+        print(f"Error: {exc}")
+    except Exception as exc:
+        logger.exception("Unexpected error in manual console flow")
+        print(f"Unexpected error: {exc}")
+    finally:
+        close_driver(driver)
 
 
 if __name__ == "__main__":

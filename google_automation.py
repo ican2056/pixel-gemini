@@ -670,7 +670,8 @@ class GoogleAutomationError(Exception):
 def check_gemini_offer(email: str, password: str,
                        device: DeviceProfile,
                        totp_secret: Optional[str] = None,
-                       progress_callback: ProgressCB = None) -> Optional[str]:
+                       progress_callback: ProgressCB = None,
+                       keep_browser_open: bool = False) -> Optional[str]:
     """
     Main entry point.
 
@@ -679,8 +680,12 @@ def check_gemini_offer(email: str, password: str,
 
     progress_callback(msg: str, screenshot_bytes: Optional[bytes]) is called
     at every key step so the caller can relay live updates to Telegram.
+
+    If keep_browser_open is True and an offer link is found, keep the browser
+    available for manual inspection until Enter or Ctrl-C is pressed.
     """
     driver: Optional[webdriver.Chrome] = None
+    offer_link: Optional[str] = None
     try:
         _report(progress_callback,
                 f"🤖 Starting Pixel 10 Pro simulator\n"
@@ -706,6 +711,16 @@ def check_gemini_offer(email: str, password: str,
     finally:
         if driver:
             try:
+                if keep_browser_open and offer_link:
+                    _report(
+                        progress_callback,
+                        "Browser is being kept open for VNC inspection. "
+                        "Press Enter in the console (or Ctrl-C) to close it.",
+                    )
+                    try:
+                        input("Press Enter to close the browser: ")
+                    except (EOFError, KeyboardInterrupt):
+                        pass
                 _report(progress_callback, "🧹 Closing browser session…")
                 driver.quit()
             except Exception:

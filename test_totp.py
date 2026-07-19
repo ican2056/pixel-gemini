@@ -92,6 +92,10 @@ def main():
     email = _prompt_nonempty("Google email: ")
     password = _prompt_nonempty("Google password (input hidden): ", hidden=True)
 
+    # Replit opens its authenticated VNC pane when Chromium creates a native
+    # window. No external VNC server or additional Python package is required.
+    google_automation.config.HEADLESS = False
+
     logger.info("=" * 60)
     logger.info("TEST: 6-digit TOTP entry + login confirmation")
     logger.info("Account credentials received from the terminal")
@@ -113,6 +117,7 @@ def main():
             # never used to generate a code because of the provider above.
             totp_secret="manual-terminal-code",
             progress_callback=progress_callback,
+            keep_browser_open=True,
         )
     except GoogleAutomationError as exc:
         logger.error("Automation error: %s", exc)

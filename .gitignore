@@ -7,3 +7,11 @@ dist/
 build/
 .venv/
 venv/
+
+# IDE
+.idea/
+.vscode/
+
+# Logs
+*.log
+logs/

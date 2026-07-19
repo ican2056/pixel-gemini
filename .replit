@@ -11,10 +11,6 @@ name = "Run"
 
 [[workflows.workflow.tasks]]
 task = "shell.exec"
-args = "python -m pip install -r requirements.txt"
-
-[[workflows.workflow.tasks]]
-task = "shell.exec"
 args = "python main.py"
 
 [workflows.workflow.metadata]

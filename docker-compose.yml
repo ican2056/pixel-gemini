@@ -1,7 +1,7 @@
 services:
-  pixel-ppy:
+  autpixel:
     build: .
-    container_name: pixel-ppy
+    container_name: autpixel
     restart: on-failure:3
     environment:
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}

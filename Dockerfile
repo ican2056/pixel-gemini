@@ -17,9 +17,13 @@ WORKDIR /app
 
 # Install Python deps first (better layer caching)
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
 
 # Copy source code
-COPY config.py device_simulator.py google_automation.py main.py ./
+COPY config.py main.py ./
+COPY core ./core
+COPY handlers ./handlers
+COPY services ./services
 
 CMD ["python", "main.py"]

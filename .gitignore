@@ -15,3 +15,21 @@ venv/
 # Logs
 *.log
 logs/
+
+# Temporary local debug helpers
+tmp_*.py
+
+# Local proxy list
+proxies.txt
+
+# Extra Python/cache artifacts
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.sqlite3
+*.db
+*.pkl
+*.pickle
+.idea/

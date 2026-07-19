@@ -3,43 +3,79 @@ Telegram Bot entry point for the Pixel 10 Pro Google One Gemini Bot.
 
 Commands:
   /start        – Show welcome message and available commands
+  /doctor       – Run a first-time setup self-check
   /login        – Begin credential capture flow (email → password)
+  /witai        – Save or clear the Wit.ai token used for audio captcha solving
   /logout       – Clear stored credentials and session data
   /check_offer  – Run Google One automation and look for Gemini Pro offer
   /get_link     – Show the last captured offer link
   /status       – Show current session status and device profile
+  /disable_proxy – Force the current session to use direct/local IP
+  /lang_id      – Switch chat language to Indonesian
+  /langid       – Alias for /lang_id
 
 Supports both Gmail (user@gmail.com) and Google Workspace (user@company.com)
 accounts.
 """
 
-import asyncio
 import logging
 import os
-import re
 import sys
-import time
 
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
+# Clean up NO_PROXY / no_proxy to prevent httpx from crashing on IPv6 loopback addresses like ::1 on Windows
+for _var_name in ("no_proxy", "NO_PROXY"):
+    if _var_name in os.environ:
+        _parts = [p.strip() for p in os.environ[_var_name].split(",")]
+        _cleaned = [p for p in _parts if p not in ("::1", "::1/128")]
+        os.environ[_var_name] = ",".join(_cleaned)
+
+from telegram import Update
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ConversationHandler,
     MessageHandler,
-    ContextTypes,
     filters,
 )
 
 import config
-from device_simulator import create_device_profile
-from google_automation import (
-    GoogleAutomationError,
-    start_manual_login,
-    start_login,
-    submit_2fa_code,
-    check_offer_with_driver,
-    close_driver,
+from handlers import (
+    AWAIT_2FA_CODE,
+    AWAIT_EMAIL,
+    AWAIT_MANUAL_VERIFICATION,
+    AWAIT_PASSWORD,
+    AWAIT_WIT_AI_TOKEN,
+    DEVICE_CALLBACK_PREFIX,
+    cancel_2fa,
+    check_offer,
+    device_menu,
+    device_select,
+    doctor,
+    disable_proxy,
+    get_link,
+    handle_2fa_code,
+    handle_manual_verification,
+    ip_status,
+    lang_en,
+    lang_id,
+    login_cancel,
+    login_email,
+    login_password,
+    login_start,
+    logout,
+    offer_timeout,
+    proxy_status,
+    rotate_proxy,
+    session_cleanup_job,
+    start,
+    status,
+    wit_ai_cancel,
+    wit_ai_start,
+    wit_ai_token,
 )
+from handlers.ui import button_regex
+from services.setup_diagnostics import collect_setup_diagnostics
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 from datetime import datetime as _dt
@@ -67,654 +103,142 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ── Conversation states ───────────────────────────────────────────────────────
-AWAIT_EMAIL, AWAIT_PASSWORD = range(2)
-AWAIT_2FA_CODE = 10  # Separate state for 2FA code input
-
-# ── Rate limiting & concurrency ───────────────────────────────────────────────
-# Per-user cooldown: maps chat_id → last /check_offer timestamp
-_LAST_CHECK_TIME: dict[int, float] = {}
-CHECK_OFFER_COOLDOWN = 5 * 60  # 5 minutes between checks per user
-
-# Limit the number of simultaneous Chrome instances (1 for ≤4GB RAM servers)
-_CHROME_SEMAPHORE = asyncio.Semaphore(1)
-
-# ── Session storage ───────────────────────────────────────────────────────────
-# In-memory dict keyed by Telegram chat_id.
-# Values: {"email": bytearray, "password": bytearray, "device": DeviceProfile,
-#          "offer_link": str|None, "created_at": float}
-SESSION_STORE: dict[int, dict] = {}
-
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def _get_session(chat_id: int) -> dict:
-    """Return (creating if absent) the session dict for *chat_id*.
-
-    Automatically purges the session if it has exceeded the TTL.
-    """
-    session = SESSION_STORE.get(chat_id)
-    if session and _is_session_expired(session):
-        logger.info("Session expired for chat %s – purging", chat_id)
-        _clear_session(chat_id)
-        session = None
-    if session is None:
-        SESSION_STORE[chat_id] = {}
-    return SESSION_STORE[chat_id]
-
-
-def _is_session_expired(session: dict) -> bool:
-    """Return True if *session* has exceeded the configured TTL."""
-    created = session.get("created_at")
-    if created is None:
-        return False
-    return (time.time() - created) > config.SESSION_TTL_SECONDS
-
-
-def _secure_wipe(data: bytearray) -> None:
-    """Zero-fill a bytearray in-place so the original bytes are unrecoverable."""
-    for i in range(len(data)):
-        data[i] = 0
-
-
-def _clear_session(chat_id: int) -> None:
-    """Securely wipe credentials and remove the session for *chat_id*."""
-    session = SESSION_STORE.pop(chat_id, None)
-    if session is None:
-        return
-    # Securely overwrite bytearray credentials in-place
-    for key in ("password", "email"):
-        val = session.get(key)
-        if isinstance(val, bytearray):
-            _secure_wipe(val)
-    session.clear()
-    logger.debug("Session cleared for chat %s", chat_id)
-
-
-def _purge_expired_sessions() -> int:
-    """Remove all expired sessions.  Returns the number purged."""
-    expired = [
-        cid for cid, sess in SESSION_STORE.items()
-        if _is_session_expired(sess)
-    ]
-    for cid in expired:
-        _clear_session(cid)
-    if expired:
-        logger.info("Purged %d expired session(s)", len(expired))
-    return len(expired)
-
-
-# ── Handlers ──────────────────────────────────────────────────────────────────
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Send welcome message with command menu."""
-    await update.message.reply_text(
-        "🤖 *Pixel 10 Pro Google One Bot*\n\n"
-        "This bot simulates a Google Pixel 10 Pro (Android 16) device, "
-        "logs into your Google account, and retrieves the *12-month free "
-        "Gemini Pro* offer link from Google One.\n\n"
-        "📋 *Available Commands:*\n"
-        "• /login – Enter your Google account credentials\n"
-        "• /logout – Clear stored credentials\n"
-        "• /check\\_offer – Detect the Gemini Pro offer\n"
-        "• /get\\_link – Show the last captured offer link\n"
-        "• /status – View current session \u0026 device info\n\n"
-        "💡 *Tip:* Both Gmail and Google Workspace accounts are supported.\n\n"
-        "⚠️ *Privacy Note:* Credentials are held in memory only for the "
-        "duration of the session and never stored persistently.",
-        parse_mode="Markdown",
-    )
-
-
-# ── /login conversation ───────────────────────────────────────────────────────
-
-async def login_start(update: Update,
-                      context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Begin the login conversation – ask for email."""
-    await update.message.reply_text(
-        "📧 Please enter your Google account email "
-        "(Gmail or Google Workspace):",
-        reply_markup=ReplyKeyboardRemove(),
-    )
-    return AWAIT_EMAIL
-
-
-async def login_email(update: Update,
-                      context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Store the email and ask for password."""
-    email = update.message.text.strip()
-
-    # Basic email format validation (Gmail and Google Workspace accounts)
-    if not re.match(r'^[\w.+-]+@[\w.-]+\.[a-zA-Z]{2,}$', email, re.IGNORECASE):
-        await update.message.reply_text(
-            "⚠️ Please enter a valid email address "
-            "(e.g. user@gmail.com or user@company.com)."
-        )
-        return AWAIT_EMAIL
-
-    # Optional domain restriction (empty list = accept any domain)
-    allowed = config.ALLOWED_EMAIL_DOMAINS
-    if allowed:
-        domain = email.rsplit("@", 1)[1].lower()
-        if domain not in [d.lower() for d in allowed]:
-            domains_str = ", ".join(f"@{d}" for d in allowed)
-            await update.message.reply_text(
-                f"⚠️ Only the following email domains are accepted: "
-                f"{domains_str}\n\nPlease try again."
-            )
-            return AWAIT_EMAIL
-
-    context.user_data["pending_email"] = email
-    await update.message.reply_text(
-        f"✅ Email received: `{email}`\n\n🔒 Now enter your password:",
-        parse_mode="Markdown",
-    )
-    return AWAIT_PASSWORD
-
-
-async def login_password(update: Update,
-                         context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Store credentials, generate a new device profile, and finish."""
-    chat_id = update.effective_chat.id
-    raw_input = update.message.text.strip()
-    email = context.user_data.pop("pending_email", "")
-
-    # Parse password|totp_secret format
-    if "|" in raw_input:
-        password, totp_secret = raw_input.split("|", 1)
-        password = password.strip()
-        totp_secret = totp_secret.strip()
-    else:
-        password = raw_input
-        totp_secret = None
-
-    session = _get_session(chat_id)
-    # Store credentials as bytearray for secure in-place wiping
-    session["email"] = bytearray(email.encode("utf-8"))
-    session["password"] = bytearray(password.encode("utf-8"))
-    if totp_secret:
-        session["totp_secret"] = totp_secret
-    session["device"] = create_device_profile()
-    session["offer_link"] = None
-    session["created_at"] = time.time()
-
-    # Delete the message containing the password for security
-    try:
-        await update.message.delete()
-    except Exception:
-        pass
-
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=(
-            "✅ *Credentials saved* and a new Pixel 10 Pro device profile has "
-            "been created for this session.\n\n"
-            + session["device"].summary()
-            + ("\U0001f511 TOTP secret saved \u2013 2FA will be handled automatically.\n\n"
-               if totp_secret else "")
-            + "Use /check\\_offer to search for the Gemini Pro offer."
-        ),
-        parse_mode="Markdown",
-    )
-    return ConversationHandler.END
-
-
-async def login_cancel(update: Update,
-                       context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Cancel the login conversation."""
-    context.user_data.pop("pending_email", None)
-    await update.message.reply_text(
-        "❌ Login cancelled.",
-        reply_markup=ReplyKeyboardRemove(),
-    )
-    return ConversationHandler.END
-
-
-# ── /logout ───────────────────────────────────────────────────────────────────
-
-async def logout(update: Update,
-                 context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Clear stored credentials and destroy the session."""
-    chat_id = update.effective_chat.id
-    if chat_id in SESSION_STORE:
-        _clear_session(chat_id)
-        await update.message.reply_text(
-            "🔒 Credentials and session data have been securely cleared."
-        )
-    else:
-        await update.message.reply_text(
-            "ℹ️ No active session to clear."
-        )
-
-
-# ── /check_offer ──────────────────────────────────────────────────────────────
-
-async def _report_offer(update_or_chat_id, context, session, offer_link) -> None:
-    """Send the offer result message."""
-    chat_id = (update_or_chat_id if isinstance(update_or_chat_id, int)
-               else update_or_chat_id.effective_chat.id)
-    if offer_link:
-        session["offer_link"] = offer_link
-        text = (
-            "🎉 <b>Gemini Pro Offer Found!</b>\n\n"
-            "Click the link below to activate your 12-month free Gemini Pro:\n\n"
-            f"🔗 {offer_link}\n\n"
-            "Use /get_link to retrieve this link again."
-        )
-        try:
-            await context.bot.send_message(
-                chat_id=chat_id, text=text, parse_mode="HTML",
-            )
-        except Exception:
-            # Fallback: send without formatting
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=f"🎉 Gemini Pro Offer Found!\n\n🔗 {offer_link}\n\nUse /get_link to retrieve this link again.",
-            )
-    else:
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=(
-                "😔 No active Gemini Pro offer was detected on your Google One "
-                "account at this time.\n\n"
-                "The offer may not be available for your account region or may "
-                "have already been activated. Try again later."
-            ),
-        )
-
-
-async def check_offer(update: Update,
-                      context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Run Google One automation and report the result.
-
-    If the offer is not found, retry with a new device profile up to
-    ``_MAX_OFFER_ATTEMPTS`` times before reporting failure.
-    """
-    _MAX_OFFER_ATTEMPTS = 3
-    chat_id = update.effective_chat.id
-    session = _get_session(chat_id)
-
-    if not session.get("email") or not session.get("password"):
-        await update.message.reply_text(
-            "⚠️ No credentials found. Please use /login first."
-        )
-        return ConversationHandler.END
-
-    # ── Rate limit check ──────────────────────────────────────────────────
-    last_check = _LAST_CHECK_TIME.get(chat_id, 0)
-    elapsed = time.time() - last_check
-    if elapsed < CHECK_OFFER_COOLDOWN:
-        remaining = int(CHECK_OFFER_COOLDOWN - elapsed)
-        mins, secs = divmod(remaining, 60)
-        await update.message.reply_text(
-            f"⏳ Please wait {mins}m {secs}s before checking again."
-        )
-        return ConversationHandler.END
-    _LAST_CHECK_TIME[chat_id] = time.time()
-
-    # ── Concurrency check ─────────────────────────────────────────────────
-    if _CHROME_SEMAPHORE.locked():
-        await update.message.reply_text(
-            "🔄 The system is currently at maximum capacity. "
-            "Please try again in a minute."
-        )
-        _LAST_CHECK_TIME.pop(chat_id, None)
-        return ConversationHandler.END
-
-    await update.message.reply_text(
-        "⏳ Launching Pixel 10 Pro device simulator and logging in…\n"
-        "This may take up to 60 seconds."
-    )
-
-    try:
-        async with _CHROME_SEMAPHORE:
-            # Decode bytearray credentials to str for Selenium
-            email_str = bytes(session["email"]).decode("utf-8")
-            pw_str = bytes(session["password"]).decode("utf-8")
-            offer_link = None
-
-            for attempt in range(1, _MAX_OFFER_ATTEMPTS + 1):
-                # Create a fresh device profile for each attempt
-                device = create_device_profile()
-                session["device"] = device
-
-                if attempt > 1:
-                    await update.message.reply_text(
-                        f"🔄 Attempt {attempt}/{_MAX_OFFER_ATTEMPTS}: "
-                        "Creating new Pixel 10 Pro device and retrying…"
-                    )
-
-                # Start login in a thread
-                driver = None
-                try:
-                    driver, status = await asyncio.to_thread(
-                        start_login, email_str, pw_str, device,
-                    )
-
-                    if status == "needs_totp":
-                        totp_secret = session.get("totp_secret")
-                        if totp_secret:
-                            try:
-                                import pyotp
-                                totp = pyotp.TOTP(totp_secret)
-                                code = totp.now()
-                                logger.info(
-                                    "Auto-generated TOTP code for chat %s (attempt %d)",
-                                    chat_id, attempt,
-                                )
-
-                                accepted = await asyncio.to_thread(
-                                    submit_2fa_code, driver, code,
-                                )
-                                if not accepted:
-                                    close_driver(driver)
-                                    driver = None
-                                    await update.message.reply_text(
-                                        "❌ Auto-generated TOTP code was rejected. "
-                                        "Please check your TOTP secret key."
-                                    )
-                                    return ConversationHandler.END
-
-                                # 2FA passed – notify and check offer
-                                await update.message.reply_text(
-                                    f"✅ 登录成功（第 {attempt}/{_MAX_OFFER_ATTEMPTS} 次），"
-                                    "正在检查 Gemini Pro 优惠…"
-                                )
-                                offer_link = await asyncio.to_thread(
-                                    check_offer_with_driver, driver,
-                                )
-                            except Exception as exc:
-                                logger.warning("Auto-TOTP failed: %s", exc)
-                                close_driver(driver)
-                                driver = None
-                                await update.message.reply_text(
-                                    f"❌ Auto-TOTP error: {exc}\n"
-                                    "Please check your TOTP secret key."
-                                )
-                                return ConversationHandler.END
-                        else:
-                            # No TOTP secret – ask user for code interactively
-                            # (no retry for interactive 2FA)
-                            session["_driver"] = driver
-                            await update.message.reply_text(
-                                "🔐 *Two-Factor Authentication Required*\n\n"
-                                "Please enter your 6-digit authenticator code:",
-                                parse_mode="Markdown",
-                            )
-                            return AWAIT_2FA_CODE
-                    else:
-                        # Login succeeded (no 2FA) – notify and check offer
-                        await update.message.reply_text(
-                            f"✅ 登录成功（第 {attempt}/{_MAX_OFFER_ATTEMPTS} 次），"
-                            "正在检查 Gemini Pro 优惠…"
-                        )
-                        offer_link = await asyncio.to_thread(
-                            check_offer_with_driver, driver,
-                        )
-                finally:
-                    if driver:
-                        if session.get("_driver") is driver:
-                            # Interactive 2FA owns this driver until the code is submitted.
-                            pass
-                        elif offer_link and session.get("_keep_browser_open"):
-                            session["_driver"] = driver
-                        else:
-                            close_driver(driver)
-
-                # If offer found, stop retrying
-                if offer_link:
-                    logger.info(
-                        "Offer found on attempt %d for chat %s: %s",
-                        attempt, chat_id, offer_link,
-                    )
-                    break
-
-                # Offer not found – log and wait before retrying
-                logger.info(
-                    "No offer found on attempt %d/%d for chat %s",
-                    attempt, _MAX_OFFER_ATTEMPTS, chat_id,
-                )
-
-                # Wait before next attempt to avoid rate-limiting
-                if attempt < _MAX_OFFER_ATTEMPTS:
-                    import random as _rand
-                    delay = _rand.randint(15, 30)
-                    await update.message.reply_text(
-                        f"⏳ 未检测到优惠，{delay} 秒后开始第 {attempt + 1} 次尝试…"
-                    )
-                    await asyncio.sleep(delay)
-                    await update.message.reply_text(
-                        f"🔄 开始第 {attempt + 1}/{_MAX_OFFER_ATTEMPTS} 次尝试，"
-                        "正在创建新设备并登录…"
-                    )
-
-    except GoogleAutomationError as exc:
-        await update.message.reply_text(f"❌ <b>Error:</b> {exc}", parse_mode="HTML")
-        return ConversationHandler.END
-    except Exception as exc:
-        logger.exception("Unexpected error in check_offer for chat %s", chat_id)
-        await update.message.reply_text(
-            f"❌ An unexpected error occurred: {exc}"
-        )
-        return ConversationHandler.END
-    finally:
-        # Securely wipe password after use
-        pw = session.get("password")
-        if isinstance(pw, bytearray):
-            _secure_wipe(pw)
-        session.pop("password", None)
-
-    if not offer_link:
-        await update.message.reply_text(
-            f"❌ 经过 {_MAX_OFFER_ATTEMPTS} 次尝试，未找到 Gemini Pro 优惠。\n\n"
-            "您的账号不符合 Pixel 设备 Gemini Pro 12个月免费领取条件。\n"
-            "可能的原因：\n"
-            "• 账号地区不支持\n"
-            "• 已有有效的 Gemini Pro 订阅\n"
-            "• 账号在家庭组中且有成员已订阅\n"
-            "• 新注册账号触发风控"
-        )
-        return ConversationHandler.END
-
-    await _report_offer(update, context, session, offer_link)
-    return ConversationHandler.END
-
-
-async def handle_2fa_code(update: Update,
-                          context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle the TOTP code submitted by the user during 2FA."""
-    chat_id = update.effective_chat.id
-    session = _get_session(chat_id)
-    code = update.message.text.strip()
-
-    # Delete the message containing the code for security
-    offer_link = None
-    try:
-        await update.message.delete()
-    except Exception:
-        pass
-
-    driver = session.pop("_driver", None)
-    if not driver:
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=r"⚠️ Session expired. Please run /check\_offer again.",
-        )
-        return ConversationHandler.END
-
-    # Validate code format
-    if not code.isdigit() or len(code) != 6:
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text="⚠️ Invalid code. Please enter a 6-digit number.",
-        )
-        session["_driver"] = driver  # Put driver back
-        return AWAIT_2FA_CODE
-
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text="🔄 Verifying code…",
-    )
-
-    try:
-        async with _CHROME_SEMAPHORE:
-            accepted = await asyncio.to_thread(
-                submit_2fa_code, driver, code,
-            )
-
-            if not accepted:
-                close_driver(driver)
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=r"❌ Code rejected. Please run /check\_offer again.",
-                )
-                return ConversationHandler.END
-
-            # 2FA passed – check offer
-            try:
-                offer_link = await asyncio.to_thread(
-                    check_offer_with_driver, driver,
-                )
-            finally:
-                if offer_link and session.get("_keep_browser_open"):
-                    session["_driver"] = driver
-                else:
-                    close_driver(driver)
-
-    except Exception as exc:
-        logger.exception("Error in 2FA for chat %s", chat_id)
-        close_driver(driver)
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=f"❌ Error: {exc}",
-        )
-        return ConversationHandler.END
-    finally:
-        pw = session.get("password")
-        if isinstance(pw, bytearray):
-            _secure_wipe(pw)
-        session.pop("password", None)
-
-    await _report_offer(chat_id, context, session, offer_link)
-    return ConversationHandler.END
-
-
-async def cancel_2fa(update: Update,
-                     context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Cancel 2FA input and close the driver."""
-    chat_id = update.effective_chat.id
-    session = _get_session(chat_id)
-    driver = session.pop("_driver", None)
-    close_driver(driver)
-    await update.message.reply_text("❌ 2FA cancelled.")
-    return ConversationHandler.END
-
-
-# ── /get_link ─────────────────────────────────────────────────────────────────
-
-async def get_link(update: Update,
-                   context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Return the last captured offer link for this session."""
-    chat_id = update.effective_chat.id
-    session = _get_session(chat_id)
-    link = session.get("offer_link")
-
-    if link:
-        await update.message.reply_text(
-            f"🔗 <b>Last captured offer link:</b>\n\n{link}",
-            parse_mode="HTML",
-        )
-    else:
-        await update.message.reply_text(
-            "ℹ️ No offer link has been captured yet. "
-            "Use /check\\_offer to search for the Gemini Pro offer.",
-            parse_mode="Markdown",
-        )
-
-
-# ── /status ───────────────────────────────────────────────────────────────────
-
-async def status(update: Update,
-                 context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show current session and device profile summary."""
-    chat_id = update.effective_chat.id
-
-    if chat_id not in SESSION_STORE or not SESSION_STORE[chat_id]:
-        await update.message.reply_text(
-            "ℹ️ No active session. Use /login to get started."
-        )
-        return
-
-    session = SESSION_STORE[chat_id]
-
-    email_raw = session.get("email", "—")
-    # Decode bytearray email for display
-    if isinstance(email_raw, bytearray):
-        email = bytes(email_raw).decode("utf-8")
-    else:
-        email = str(email_raw) if email_raw else "—"
-    has_creds = bool(session.get("email") and session.get("password"))
-    offer_link = session.get("offer_link")
-    device = session.get("device")
-
-    lines = [
-        "📊 *Session Status*\n",
-        f"Account: `{email}`",
-        f"Credentials loaded: {'✅' if has_creds else '❌'}",
-        f"Offer link captured: {'✅' if offer_link else '❌'}",
-    ]
-
-    if device:
-        lines.append("\n" + device.summary())
-
-    await update.message.reply_text(
-        "\n".join(lines),
-        parse_mode="Markdown",
-    )
-
-
-
-# ── Periodic cleanup ──────────────────────────────────────────────────────────
-
-async def _session_cleanup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Periodic callback to purge expired sessions."""
-    _purge_expired_sessions()
-
 
 # ── Application setup ─────────────────────────────────────────────────────────
 
+def _log_startup_diagnostics() -> None:
+    """Emit a concise startup checklist to the application log."""
+    report = collect_setup_diagnostics()
+    logger.info(
+        "Startup self-check summary: %s",
+        report["summary"].upper(),
+    )
+    for item in report["checks"]:
+        logger.info("Startup check %-18s %s", item["name"], item["status"].upper())
+
 def main() -> None:
-    """Hand Google login to VNC, then run the original offer checker."""
-    config.HEADLESS = False
-    driver = None
-
-    print("Pixel 10 Pro Google One Gemini Offer Checker")
-    print("Opening Google sign-in in the Replit VNC browser...")
-    try:
-        device = create_device_profile()
-        driver = start_manual_login(device)
-        input(
-            "Complete Google login and any verification in VNC, then press Enter "
-            "here to check the offer..."
+    token = config.TELEGRAM_BOT_TOKEN
+    if not token:
+        logger.error(
+            "TELEGRAM_BOT_TOKEN environment variable is not set. "
+            "Set it as an environment variable (e.g. via .env file or "
+            "system environment) and restart."
         )
+        sys.exit(1)
 
-        print("Checking the Google One Gemini offer...")
-        offer_link = check_offer_with_driver(driver)
-        if offer_link:
-            print(f"Valid offer link: {offer_link}")
-        else:
-            print("No valid Pixel Gemini offer link was found.")
+    _log_startup_diagnostics()
 
-        input("The browser will remain open. Press Enter to close it...")
-    except KeyboardInterrupt:
-        print("\nStopped by user.")
-    except GoogleAutomationError as exc:
-        print(f"Error: {exc}")
-    except Exception as exc:
-        logger.exception("Unexpected error in manual console flow")
-        print(f"Unexpected error: {exc}")
-    finally:
-        close_driver(driver)
+    app = Application.builder().token(token).build()
+
+    # /login conversation
+    login_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("login", login_start),
+            CallbackQueryHandler(login_start, pattern=r"^menu:login$"),
+            MessageHandler(filters.Regex(button_regex("menu_login")), login_start),
+        ],
+        states={
+            AWAIT_EMAIL: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, login_email)
+            ],
+            AWAIT_PASSWORD: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, login_password)
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", login_cancel)],
+        allow_reentry=True,
+    )
+
+    wit_ai_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("witai", wit_ai_start),
+        ],
+        states={
+            AWAIT_WIT_AI_TOKEN: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, wit_ai_token)
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", wit_ai_cancel)],
+        allow_reentry=True,
+    )
+
+    offer_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("check_offer", check_offer),
+            CallbackQueryHandler(check_offer, pattern=r"^menu:check_offer$"),
+            MessageHandler(filters.Regex(button_regex("menu_check_offer")), check_offer),
+        ],
+        states={
+            AWAIT_2FA_CODE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_2fa_code)
+            ],
+            AWAIT_MANUAL_VERIFICATION: [
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND,
+                    handle_manual_verification,
+                )
+            ],
+            ConversationHandler.TIMEOUT: [
+                MessageHandler(filters.ALL, offer_timeout)
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_2fa)],
+        allow_reentry=True,
+        conversation_timeout=300,  # 5 minutes for TOTP or manual verification
+    )
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("doctor", doctor))
+    app.add_handler(CallbackQueryHandler(start, pattern=r"^menu:home$"))
+    app.add_handler(MessageHandler(filters.Regex(button_regex("menu_home")), start))
+    app.add_handler(CommandHandler("lang_en", lang_en))
+    app.add_handler(CallbackQueryHandler(lang_en, pattern=r"^menu:lang_en$"))
+    app.add_handler(MessageHandler(filters.Regex(button_regex("menu_lang_en")), lang_en))
+    app.add_handler(CommandHandler("lang_id", lang_id))
+    app.add_handler(CommandHandler("langid", lang_id))
+    app.add_handler(CallbackQueryHandler(lang_id, pattern=r"^menu:lang_id$"))
+    app.add_handler(MessageHandler(filters.Regex(button_regex("menu_lang_id")), lang_id))
+    app.add_handler(login_conv)
+    app.add_handler(wit_ai_conv)
+    app.add_handler(CommandHandler("logout", logout))
+    app.add_handler(CallbackQueryHandler(logout, pattern=r"^menu:logout$"))
+    app.add_handler(MessageHandler(filters.Regex(button_regex("menu_logout")), logout))
+    app.add_handler(offer_conv)
+    app.add_handler(CommandHandler("get_link", get_link))
+    app.add_handler(CallbackQueryHandler(get_link, pattern=r"^menu:get_link$"))
+    app.add_handler(MessageHandler(filters.Regex(button_regex("menu_get_link")), get_link))
+    app.add_handler(CommandHandler("ip", ip_status))
+    app.add_handler(CallbackQueryHandler(ip_status, pattern=r"^menu:ip$"))
+    app.add_handler(MessageHandler(filters.Regex(button_regex("menu_ip")), ip_status))
+    app.add_handler(CommandHandler("proxy", proxy_status))
+    app.add_handler(CallbackQueryHandler(proxy_status, pattern=r"^menu:proxy$"))
+    app.add_handler(MessageHandler(filters.Regex(button_regex("menu_proxy")), proxy_status))
+    app.add_handler(CommandHandler("rotate_proxy", rotate_proxy))
+    app.add_handler(CallbackQueryHandler(rotate_proxy, pattern=r"^menu:rotate_proxy$"))
+    app.add_handler(MessageHandler(filters.Regex(button_regex("menu_rotate_proxy")), rotate_proxy))
+    app.add_handler(CommandHandler("disable_proxy", disable_proxy))
+    app.add_handler(CallbackQueryHandler(disable_proxy, pattern=r"^menu:disable_proxy$"))
+    app.add_handler(MessageHandler(filters.Regex(button_regex("menu_disable_proxy")), disable_proxy))
+    app.add_handler(CommandHandler("status", status))
+    app.add_handler(CallbackQueryHandler(status, pattern=r"^menu:status$"))
+    app.add_handler(MessageHandler(filters.Regex(button_regex("menu_status")), status))
+    app.add_handler(CommandHandler("device", device_menu))
+    app.add_handler(CallbackQueryHandler(device_menu, pattern=r"^menu:device$"))
+    app.add_handler(MessageHandler(filters.Regex(button_regex("menu_device")), device_menu))
+    app.add_handler(
+        CallbackQueryHandler(device_select, pattern=rf"^{DEVICE_CALLBACK_PREFIX}")
+    )
+
+    # Periodic job: purge expired sessions every 5 minutes
+    app.job_queue.run_repeating(
+        session_cleanup_job, interval=300, first=300,
+    )
+
+    logger.info("Bot is running. Press Ctrl-C to stop.")
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        bootstrap_retries=5,
+    )
 
 
 if __name__ == "__main__":

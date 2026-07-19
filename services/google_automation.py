@@ -165,6 +165,43 @@ def resolve_browser_binaries() -> tuple[Optional[str], Optional[str]]:
     return chrome_bin, chromedriver_path
 
 
+def _prepare_patchable_driver(chromedriver_path: str | None) -> str | None:
+    """Copy a Nix Store driver to writable storage before UC patches it."""
+    if not chromedriver_path:
+        return None
+
+    resolved_path = os.path.realpath(chromedriver_path)
+    if not resolved_path.startswith("/nix/store/"):
+        return chromedriver_path
+
+    import hashlib
+    import shutil
+    import tempfile
+
+    cache_dir = os.path.join(tempfile.gettempdir(), "autopixel-chromedriver")
+    os.makedirs(cache_dir, exist_ok=True)
+    path_token = hashlib.sha256(resolved_path.encode("utf-8")).hexdigest()[:12]
+    writable_path = os.path.join(cache_dir, f"chromedriver-{path_token}")
+
+    if not os.path.exists(writable_path):
+        temporary_path = f"{writable_path}.{os.getpid()}.tmp"
+        try:
+            shutil.copy2(chromedriver_path, temporary_path)
+            os.chmod(temporary_path, 0o700)
+            os.replace(temporary_path, writable_path)
+        finally:
+            if os.path.exists(temporary_path):
+                os.remove(temporary_path)
+    else:
+        os.chmod(writable_path, 0o700)
+
+    logger.info(
+        "Using writable chromedriver copy for undetected-chromedriver: %s",
+        writable_path,
+    )
+    return writable_path
+
+
 def _detect_driver_major_version(chromedriver_path: str | None) -> Optional[int]:
     """Return the detected chromedriver major version, if available."""
     import subprocess
@@ -232,6 +269,7 @@ def build_driver(
         )
 
     chrome_bin, chromedriver_path = resolve_browser_binaries()
+    chromedriver_path = _prepare_patchable_driver(chromedriver_path)
     browser_major = config.CHROME_MAJOR_VERSION
     driver_major = _detect_driver_major_version(chromedriver_path)
 
